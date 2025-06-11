@@ -16,7 +16,7 @@ de l'utilisateur trouvé.
 Usage (depuis la racine du projet) :
     python3 scripts/rename_courbes.py [--excel <chemin_vers_excel>] [--taxan-dir <chemin_vers_taxan_dir>]
 
-Si vous ne spécifiez pas d’arguments, il cherchera par défaut :
+Si vous ne spécifiez pas d'arguments, il cherchera par défaut :
     Excel  =>  data/visiteurs-aresia.xlsx
     Taxan  =>  data/taxan/
 """
@@ -56,29 +56,21 @@ def main():
         "--excel",
         "-e",
         type=str,
-        default=os.path.join("data", "visiteurs-aresia.xlsx"),
-        help="Chemin vers le fichier Excel (par défaut : data/visiteurs-aresia.xlsx)."
+        default="visiteurs-aresia.xlsx",
+        help="Chemin vers le fichier Excel (par défaut : visiteursaresia.xlsx)."
     )
     parser.add_argument(
         "--taxan-dir",
         "-t",
         type=str,
-        default=os.path.join("data", "taxan"),
+        default="taxan",
         help="Chemin vers le dossier contenant les sous-dossiers 'taxan_YYYY-MM-DD-HH-MM-SS' "
-             "(par défaut : data/taxan/)."
+             "(par défaut : taxan/)."
     )
     args = parser.parse_args()
 
     excel_path = args.excel
-    taxan_root = args.taxon_dir if False else args.tan_dir # Placeholder
-    # Correction : la ligne ci-dessus est une coquille. Il faut bien récupérer args["taxan_dir"]  
-    taxan_root = args.tan_dir if False else args.taxon_dir  # Merci de vous assurer d'utiliser args.tan_dir ou args.taxon_dir selon le parser ci-dessus.  
-
-
-    # En réalité :
-    excel_path = args.excel
-    taxan_root = args.taxon_dir
-
+    taxan_root = args.taxan_dir  # CORRECTION : erreur dans le script original
 
     # Vérifications rapides :
     if not os.path.isfile(excel_path):
@@ -96,7 +88,7 @@ def main():
     try:
         # On suppose que le fichier Excel contient au moins les colonnes :
         #   "ID", "Date d'enregistrement", "Dernière mise à jour"
-        df = pd.read_excel(excel_path, dtype={"ID": str})
+        df = pd.read_excel(excel_path, sheet_name="Visiteurs ARESIA", dtype={"ID": str})
     except Exception as exc:
         print(f"✖ ERREUR : Impossible de lire l'Excel : {exc}", file=sys.stderr)
         sys.exit(1)
@@ -106,28 +98,70 @@ def main():
     missing = required_cols - set(df.columns)
     if missing:
         print(f"✖ ERREUR : Colonnes manquantes dans l'Excel : {missing}", file=sys.stderr)
+        print(f"Colonnes disponibles : {list(df.columns)}", file=sys.stderr)
         sys.exit(1)
 
-    # Conversion des colonnes en datetime
+    # Conversion des colonnes en datetime avec gestion des formats multiples
     try:
+        # Format principal attendu : 2025-05-28T14:14:21.712Z
         df["Date d'enregistrement"] = pd.to_datetime(
-            df["Date d'enregistrement"], format="%Y-%m-%dT%H:%M:%S.%fZ"
+            df["Date d'enregistrement"], 
+            format="%Y-%m-%dT%H:%M:%S.%fZ",
+            errors='coerce'  # Les erreurs deviennent NaT
         )
+        
+        # Si certaines dates n'ont pas pu être parsées, essayer sans les millisecondes
+        mask_nan = df["Date d'enregistrement"].isna()
+        if mask_nan.any():
+            df.loc[mask_nan, "Date d'enregistrement"] = pd.to_datetime(
+                df.loc[mask_nan, "Date d'enregistrement"], 
+                format="%Y-%m-%dT%H:%M:%SZ",
+                errors='coerce'
+            )
+        
+        # Même traitement pour "Dernière mise à jour"
         df["Dernière mise à jour"] = pd.to_datetime(
-            df["Dernière mise à jour"], format="%Y-%m-%dT%H:%M:%S.%fZ"
+            df["Dernière mise à jour"], 
+            format="%Y-%m-%dT%H:%M:%S.%fZ",
+            errors='coerce'
         )
+        
+        mask_nan = df["Dernière mise à jour"].isna()
+        if mask_nan.any():
+            df.loc[mask_nan, "Dernière mise à jour"] = pd.to_datetime(
+                df.loc[mask_nan, "Dernière mise à jour"], 
+                format="%Y-%m-%dT%H:%M:%SZ",
+                errors='coerce'
+            )
+            
     except Exception as exc:
         print(f"✖ ERREUR : Impossible de parser les dates dans l'Excel : {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Supprimer les lignes avec des dates invalides
+    df = df.dropna(subset=["Date d'enregistrement", "Dernière mise à jour"])
+    
     # On s'assure que l'ID est une chaîne de caractères (str)
     df["ID"] = df["ID"].astype(str)
 
     print(f"> {len(df)} enregistrements d'utilisateurs chargés depuis l'Excel.\n")
 
+    # Afficher quelques exemples pour debug
+    print("Exemples d'enregistrements :")
+    for i in range(min(3, len(df))):
+        row = df.iloc[i]
+        print(f"  ID: {row['ID']}")
+        print(f"  Enregistrement: {row['Date d\'enregistrement']}")
+        print(f"  Dernière MAJ: {row['Dernière mise à jour']}")
+        print()
+
     # -------------------------------------------------
     # 3) Parcours des dossiers "taxan_*" et renommage
     # -------------------------------------------------
+    if not os.path.exists(taxan_root):
+        print(f"✖ ERREUR : Le dossier '{taxan_root}' n'existe pas.", file=sys.stderr)
+        sys.exit(1)
+        
     dossiers = os.listdir(taxan_root)
     dossiers.sort()
     total_dossiers = 0
@@ -147,12 +181,15 @@ def main():
         # a) Extraction de la date/heure depuis le nom du dossier
         try:
             dossier_dt = parse_datetime_from_foldername(entry)
-        except ValueError:
-            print(f"[!] Ignore '{entry}' : nom de dossier non conforme.", file=sys.stderr)
+        except ValueError as e:
+            print(f"[!] Ignore '{entry}' : {e}", file=sys.stderr)
             total_non_trouves += 1
             continue
 
+        print(f"\n> Traitement du dossier '{entry}' (timestamp: {dossier_dt})")
+
         # b) Filtrer le(s) utilisateur(s) correspondants
+        # La condition est : Date d'enregistrement <= timestamp du dossier <= Dernière mise à jour
         mask = (
             (df["Date d'enregistrement"] <= dossier_dt)
             & (dossier_dt <= df["Dernière mise à jour"])
@@ -161,18 +198,21 @@ def main():
 
         if len(candidats) == 0:
             # Aucun utilisateur trouvé
-            print(f"[!] Aucun utilisateur pour '{entry}'  (timestamp = {dossier_dt})", file=sys.stderr)
+            print(f"[!] Aucun utilisateur pour '{entry}' (timestamp = {dossier_dt})", file=sys.stderr)
+            print("    Plages disponibles :")
+            for _, row in df.iterrows():
+                print(f"    - {row['ID']}: {row['Date d\'enregistrement']} → {row['Dernière mise à jour']}")
             total_non_trouves += 1
             continue
 
         if len(candidats) > 1:
-            # Plusieurs utilisateurs trouvés (intervalle qui se chevauche)
-            print(f"[!] Conflit (plusieurs IDs) pour '{entry}'  →  {candidats['ID'].tolist()}", file=sys.stderr)
+            # Plusieurs utilisateurs trouvés (intervalles qui se chevauchent)
+            print(f"[!] Conflit (plusieurs IDs) pour '{entry}' → {candidats['ID'].tolist()}", file=sys.stderr)
             total_conflits += 1
             # On choisit de prendre le premier ID (on peut changer la logique si besoin)
+        
         user_id = candidats.iloc[0]["ID"]
-
-        print(f"→ '{entry}'  →  Utilisateur trouvé : ID={user_id}")
+        print(f"→ Utilisateur trouvé : ID={user_id}")
 
         # c) Lister tous les fichiers .png dans ce dossier
         png_files = [
@@ -180,11 +220,12 @@ def main():
             if os.path.isfile(os.path.join(full_path, f)) and f.lower().endswith(".png")
         ]
         if not png_files:
-            print(f"   (aucun .png trouvé dans '{entry}')", file=sys.stderr)
+            print(f"   (aucun .png trouvé dans '{entry}')")
             continue
 
         # On trie pour garantir un ordre stable de numérotation
         png_files.sort()
+        print(f"   Fichiers PNG trouvés : {png_files}")
 
         # d) Renommer chacun en "<ID>_courbe<i>.png"
         for idx, old_fname in enumerate(png_files, start=1):
@@ -192,27 +233,41 @@ def main():
             new_fname = f"{user_id}_courbe{idx}.png"
             new_fpath = os.path.join(full_path, new_fname)
 
-            if os.path.exists(new_fpath):
-                # Ne pas écraser un fichier déjà présent
-                print(f"   [!] Le fichier existe déjà : '{new_fpath}'  → non renommé", file=sys.stderr)
+            if os.path.exists(new_fpath) and old_fpath != new_fpath:
+                # Ne pas écraser un fichier déjà présent (sauf si c'est le même)
+                print(f"   [!] Le fichier existe déjà : '{new_fpath}' → non renommé")
+                continue
+
+            if old_fpath == new_fpath:
+                print(f"   - '{old_fname}' → déjà au bon nom")
                 continue
 
             try:
                 os.rename(old_fpath, new_fpath)
-                print(f"   - '{old_fname}'  →  '{new_fname}'")
+                print(f"   ✓ '{old_fname}' → '{new_fname}'")
                 total_png_renommes += 1
             except Exception as exc:
-                print(f"   [!] Erreur en renommant '{old_fname}' : {exc}", file=sys.stderr)
+                print(f"   [!] Erreur en renommant '{old_fname}' : {exc}")
 
     # -------------------------------------------------
     # 4) Récapitulatif
     # -------------------------------------------------
-    print("\n===== RÉCAPITULATIF =====")
+    print("\n" + "="*50)
+    print("RÉCAPITULATIF")
+    print("="*50)
     print(f"Nombre de dossiers 'taxan_*' traités : {total_dossiers}")
     print(f"  • Fichiers .png renommés            : {total_png_renommes}")
     print(f"  • Dossiers sans correspondance      : {total_non_trouves}")
     print(f"  • Dossiers avec conflit d'IDs       : {total_conflits}")
-    print("==========================\n")
+    print("="*50)
+
+    if total_non_trouves > 0:
+        print(f"\n⚠️  {total_non_trouves} dossier(s) n'ont pas pu être associés à un utilisateur.")
+        print("   Vérifiez que les plages temporelles dans l'Excel couvrent bien les timestamps des dossiers.")
+    
+    if total_conflits > 0:
+        print(f"\n⚠️  {total_conflits} dossier(s) correspondent à plusieurs utilisateurs.")
+        print("   Le script a choisi le premier utilisateur trouvé. Vérifiez les plages temporelles.")
 
 
 if __name__ == "__main__":
